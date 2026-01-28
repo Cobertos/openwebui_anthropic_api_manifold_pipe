@@ -3,7 +3,7 @@ title: Anthropic API Integration
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.5.11
+version: 0.5.12
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -30,6 +30,9 @@ Supports:
 - Native PDF Upload (visual PDF analysis with charts/images)
 
 Changelog:
+v0.5.12
+- Thinking is now streamed in the UI and folded when the thought process has ended
+
 v0.5.11
 - Added Compatibility to Build-in Tools from OpenWebUI 0.7.x 
 
