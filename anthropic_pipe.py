@@ -4,7 +4,7 @@ id: anthropic_new
 author: Podden (https://github.com/Podden/)
 github: https://github.com/Podden/openwebui_anthropic_api_manifold_pipe
 original_author: Balaxxe (Updated by nbellochi)
-version: 0.8.9
+version: 0.8.11
 license: MIT
 requirements: pydantic>=2.0.0, anthropic>=0.75.0
 environment_variables:
@@ -37,6 +37,17 @@ Supports:
 - Programmatic Tool Calling (tools callable from code execution)
 
 Changelog:
+v0.8.11
+- Added Caching time CACHE_TTL valve to choose between 5 minutes (default) and 1 hour
+- Fixed TTS in Call Mode
+- Added chat:completion done event in PHASE 7 for proper stream termination signalling
+- Fixed Tool Result and Thought Grouping for Openwebui 0.8.11
+- Fixed Programmatic Tool Call Issue
+
+v0.8.10
+- Pipe can now handle HTMLResponse Results from Tools (Rich UI with embedded iframes, HTML widgets, and file attachments)
+- Added Support for Openwebui Skills
+
 v0.8.9
 - Removed <details> tags from what's send to claude API to prevent hallucinations
 - Added Valves for Request and Tool call Timeouts
@@ -456,6 +467,15 @@ except ImportError:
     get_builtin_tools = None
     BUILTIN_TOOLS_AVAILABLE = False
 
+# Import process_tool_result for Rich UI (HTMLResponse, embeds, files)
+try:
+    from open_webui.utils.middleware import process_tool_result
+
+    PROCESS_TOOL_RESULT_AVAILABLE = True
+except ImportError:
+    process_tool_result = None
+    PROCESS_TOOL_RESULT_AVAILABLE = False
+
 # Import OpenWebUI Files and Storage for PDF native upload
 try:
     from open_webui.models.files import Files
@@ -502,7 +522,12 @@ class PipeRequestContext:
         await self.pipe.emit_event(event, self.event_emitter)
 
     async def emit_delta(self, content: str) -> None:
-        await self.emit_event({"type": "chat:message:delta", "data": {"content": content}})
+        await self.emit_event(
+            {
+                "type": "chat:completion",
+                "data": {"choices": [{"delta": {"content": content}}]},
+            }
+        )
         self.final_message.append(content)
 
     async def emit_replace(self, content: str) -> None:
@@ -717,6 +742,10 @@ class Pipe:
         ] = Field(
             default="cache tools array, system prompt and messages",
             description="Cache control scope for prompts",
+        )
+        CACHE_TTL: Literal["5 minutes", "1 hour"] = Field(
+            default="5 minutes",
+            description="Cache time-to-live. 5 minutes is default Anthropic TTL; 1 hour requires no extra cost but keeps caches warm longer across conversations.",
         )
         WEB_SEARCH_USER_CITY: str = Field(
             default="",
@@ -1556,6 +1585,13 @@ class Pipe:
     # CACHE CONTROL
     # =========================================================================
 
+    def _cache_control_marker(self) -> dict:
+        """Return the cache_control dict based on the CACHE_TTL valve setting."""
+        marker = {"type": "ephemeral"}
+        if self.valves.CACHE_TTL == "1 hour":
+            marker["ttl"] = "1h"
+        return marker
+
     def _apply_cache_control(self, payload: dict, is_tool_loop: bool = False) -> None:
         """Apply cache_control breakpoints to the payload right before sending to the API.
 
@@ -1590,18 +1626,20 @@ class Pipe:
         # --- Step 2: Cache tools (breakpoint 1) ---
         # Always cache tools at every non-disabled level — tools rarely change
         # and having a separate breakpoint ensures cache hits even when system/messages change.
+        cache_marker = self._cache_control_marker()
+
         tools = payload.get("tools", [])
         if tools:
             # Find last non-deferred tool for the breakpoint
             placed = False
             for i in range(len(tools) - 1, -1, -1):
                 if not tools[i].get("defer_loading", False):
-                    tools[i]["cache_control"] = {"type": "ephemeral"}
+                    tools[i]["cache_control"] = cache_marker
                     placed = True
                     break
             if not placed:
                 # All deferred — cache the last one anyway
-                tools[-1]["cache_control"] = {"type": "ephemeral"}
+                tools[-1]["cache_control"] = cache_marker
 
         if cache_level == "cache tools array only":
             return
@@ -1613,7 +1651,7 @@ class Pipe:
             for i in range(len(system) - 1, -1, -1):
                 block = system[i]
                 if block.get("type") == "text" and block.get("text", "").strip():
-                    block["cache_control"] = {"type": "ephemeral"}
+                    block["cache_control"] = cache_marker
                     break
 
         if cache_level == "cache tools array and system prompt":
@@ -1645,7 +1683,7 @@ class Pipe:
                         content = msg.get("content", [])
                         if content:
                             # tool_result blocks are cacheable
-                            content[-1]["cache_control"] = {"type": "ephemeral"}
+                            content[-1]["cache_control"] = cache_marker
                         break
         else:
             # Initial request: cache the last stable user message
@@ -1665,7 +1703,7 @@ class Pipe:
                 # tool_use blocks called by code_execution cannot have cache_control
                 if btype == "tool_use" and block.get("caller"):
                     continue
-                block["cache_control"] = {"type": "ephemeral"}
+                block["cache_control"] = self._cache_control_marker()
                 return
 
     def _cache_last_stable_message(self, messages: list) -> None:
@@ -3002,6 +3040,41 @@ class Pipe:
                         if __user__
                         else False
                     )
+                    # Resolve skill IDs for view_skill builtin tool
+                    skill_ids = []
+                    try:
+                        openwebui_model_id = __metadata__.get("model_id") or body.get("model", "")
+                        if openwebui_model_id and MODELS_AVAILABLE:
+                            owui_model = Models.get_model_by_id(openwebui_model_id)
+                            if owui_model:
+                                # ModelModel has .meta (ModelMeta pydantic model), not .info
+                                meta = owui_model.meta
+                                if meta:
+                                    meta_dict = meta.model_dump() if hasattr(meta, "model_dump") else (meta if isinstance(meta, dict) else {})
+                                    model_skill_ids = set(meta_dict.get("skillIds", []))
+                                else:
+                                    model_skill_ids = set()
+                                logger.debug(f"Model {openwebui_model_id} skill IDs: {model_skill_ids}")
+                                if model_skill_ids:
+                                    from open_webui.models.skills import Skills as SkillsModel
+
+                                    user_id = __user__.get("id", "") if __user__ else ""
+                                    accessible = {
+                                        s.id
+                                        for s in SkillsModel.get_skills_by_user_id(user_id, "read")
+                                    }
+                                    logger.debug(f"Accessible skills for user: {accessible}")
+                                    skill_ids = [
+                                        sid
+                                        for sid in model_skill_ids
+                                        if sid in accessible
+                                        and (s := SkillsModel.get_skill_by_id(sid))
+                                        and s.is_active
+                                    ]
+                                    logger.debug(f"Resolved skill_ids: {skill_ids}")
+                    except Exception as e:
+                        logger.debug(f"Could not resolve skill IDs: {e}")
+
                     builtin_tools = get_builtin_tools(
                         __request__,
                         {
@@ -3013,6 +3086,7 @@ class Pipe:
                             "__message_id__": (
                                 __metadata__.get("message_id") if __metadata__ else None
                             ),
+                            "__skill_ids__": skill_ids,
                         },
                         features={"memory": memory_enabled},
                         model={},
@@ -3305,7 +3379,7 @@ class Pipe:
                                     thinking_start_time = time.time()
                                     thinking_message = ""
                                     thinking_stream_start_idx = len(final_message)
-                                    thinking_prefix = "".join(final_message)  # Capture prefix once
+                                    thinking_prefix = self._ensure_block_prefix("".join(final_message))  # Capture prefix once
                                 if content_type == "redacted_thinking":
                                     # Redacted thinking blocks are preserved by the SDK's accumulated
                                     # message — they will be correctly included in the next API call
@@ -3417,7 +3491,7 @@ class Pipe:
                                                 done=True, duration=duration,
                                             )
                                             await emit_message_replace(code_exec_prefix + block)
-                                            code_exec_prefix = final_text()
+                                            code_exec_prefix = self._ensure_block_prefix(final_text())
 
                                         in_code_execution = True
                                         # Start assuming web filtering — confirmed when web_search/web_fetch appears inside
@@ -3427,7 +3501,7 @@ class Pipe:
                                         code_exec_had_web_tools = False
                                         code_exec_tool_calls_info = []
                                         code_exec_stream_start_idx = len(final_message)
-                                        code_exec_prefix = final_text()  # Capture prefix for live streaming
+                                        code_exec_prefix = self._ensure_block_prefix(final_text())  # Capture prefix for live streaming
                                         code_exec_current_code = ""
                                         code_exec_current_lang = "python"
                                         code_exec_start_time = time.time()
@@ -3441,7 +3515,7 @@ class Pipe:
                                                 done=True, duration=duration,
                                             )
                                             await emit_message_replace(code_exec_prefix + block)
-                                            code_exec_prefix = final_text()
+                                            code_exec_prefix = self._ensure_block_prefix(final_text())
 
                                         # Capture prefix for live code streaming
                                         code_exec_current_code = ""
@@ -3521,7 +3595,7 @@ class Pipe:
                                                 )
                                                 await emit_message_replace(code_exec_prefix + block)
                                                 # Update prefix for next block
-                                                code_exec_prefix = final_text()
+                                                code_exec_prefix = self._ensure_block_prefix(final_text())
 
                                             last_code_content = ""
 
@@ -3574,7 +3648,7 @@ class Pipe:
                                                         done=True, duration=duration,
                                                     )
                                                     await emit_message_replace(code_exec_prefix + block)
-                                                    code_exec_prefix = final_text()
+                                                    code_exec_prefix = self._ensure_block_prefix(final_text())
                                                     last_code_content = ""
 
                                             elif (
@@ -3641,7 +3715,7 @@ class Pipe:
                                             tool_calls_info=code_exec_tool_calls_info,
                                         )
                                         await emit_message_replace(code_exec_prefix + block)
-                                        code_exec_prefix = final_text()
+                                        code_exec_prefix = self._ensure_block_prefix(final_text())
                                         last_code_content = ""
 
                                     # Emit "complete" status only if it wasn't web filtering
@@ -4435,6 +4509,34 @@ class Pipe:
                                                         "input", {}
                                                     )
 
+                                                    # Process tool result through OpenWebUI's handler
+                                                    # for Rich UI (HTMLResponse, embeds, files)
+                                                    tool_result_embeds = []
+                                                    tool_result_files = []
+                                                    if PROCESS_TOOL_RESULT_AVAILABLE and __request__:
+                                                        try:
+                                                            tool_result, tool_result_files, tool_result_embeds = (
+                                                                process_tool_result(
+                                                                    __request__,
+                                                                    tool_name,
+                                                                    tool_result,
+                                                                    "pipe",
+                                                                    metadata=__metadata__,
+                                                                    user=__user__,
+                                                                )
+                                                            )
+                                                        except Exception as e:
+                                                            logger.warning(f"process_tool_result failed for '{tool_name}': {e}")
+
+                                                    # Emit files event if tool produced files
+                                                    if tool_result_files and __event_emitter__:
+                                                        await __event_emitter__(
+                                                            {
+                                                                "type": "files",
+                                                                "data": {"files": tool_result_files},
+                                                            }
+                                                        )
+
                                                     # Determine if error
                                                     is_error = isinstance(
                                                         tool_result, str
@@ -4473,7 +4575,8 @@ class Pipe:
                                                         # Replace the in-progress block with completed version
                                                         completed = self._format_tool_result_block(
                                                             tool_use_id, tool_name, tool_input,
-                                                            str(tool_result), is_error=is_error, done=True
+                                                            str(tool_result), is_error=is_error, done=True,
+                                                            embeds=tool_result_embeds, files=tool_result_files,
                                                         )
                                                         old_block = tool_progress_blocks.pop(tool_use_id, None)
                                                         if old_block:
@@ -4941,6 +5044,14 @@ class Pipe:
                 f" [{bar}] {format_num(total_tokens)}/{context_label} ({percentage:.1f}%)"
             )
 
+        # Consolidate: emit a final replace with the complete message so OpenWebUI
+        # has the authoritative content (replaces any partial delta/replace state).
+        consolidated = final_text()
+        if consolidated:
+            await emit_event_local(
+                {"type": "replace", "data": {"content": consolidated}}
+            )
+
         await emit_event_local(
             {
                 "type": "status",
@@ -4949,6 +5060,14 @@ class Pipe:
                 },
             }
         )
+
+        # Emit chat:completion done event so frontend knows streaming finished
+        # (triggers TTS finish, usage display, etc.)
+        done_data: dict = {"choices": [{"finish_reason": "stop", "delta": {"content": ""}}], "done": True}
+        if include_usage and total_usage:
+            done_data["usage"] = total_usage
+        await emit_event_local({"type": "chat:completion", "data": done_data})
+
         if __user__["valves"].DEBUG_MODE:
             # DEBUG: content already streamed via emit_event_local; skipping duplicate
             pass
@@ -5552,6 +5671,17 @@ class Pipe:
 
         return blocks
 
+    @staticmethod
+    def _ensure_block_prefix(prefix: str) -> str:
+        """Ensure prefix ends with newline so <details> tags start on a new line.
+
+        Required because marked tokenizer regex needs ^<details at line start.
+        Without this, text before a block (e.g. '---') runs into <details>.
+        """
+        if prefix and not prefix.endswith("\n"):
+            return prefix + "\n"
+        return prefix
+
     # =========================================================================
     # IMMEDIATE BLOCK FORMATTING HELPERS
     # These format individual blocks immediately when they finish streaming
@@ -5573,14 +5703,14 @@ class Pipe:
         if duration is not None:
             duration_int = int(duration)
             return (
-                f'\n<details type="reasoning" done="true" duration="{duration_int}">\n'
+                f'<details type="reasoning" done="true" duration="{duration_int}">\n'
                 f"<summary>Thought for {duration_int} seconds</summary>\n"
                 f"{escaped_lines}\n"
                 f"</details>\n"
             )
         else:
             return (
-                f'\n<details type="reasoning" done="false">\n'
+                f'<details type="reasoning" done="false">\n'
                 f"<summary>Thinking…</summary>\n"
                 f"{escaped_lines}\n"
                 f"</details>\n"
@@ -5644,6 +5774,8 @@ class Pipe:
         tool_output: str,
         is_error: bool = False,
         done: bool = True,
+        embeds: list = None,
+        files: list = None,
     ) -> str:
         """Format a tool result block with OpenWebUI native <details type='tool_calls'> format.
 
@@ -5652,6 +5784,8 @@ class Pipe:
 
         Args:
             done: If True, shows "Tool Executed". If False, shows "Executing..." with spinner.
+            embeds: List of embed content (HTML strings, URLs) from process_tool_result.
+            files: List of file dicts from process_tool_result.
         """
         # Escape arguments for HTML attribute
         escaped_args = (
@@ -5687,15 +5821,17 @@ class Pipe:
                 )
 
             return (
-                f'\n<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
-                f'arguments="{escaped_args}" result="{escaped_result}" files="" embeds=""{error_attr}>\n'
+                f'<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
+                f'arguments="{escaped_args}" result="{escaped_result}" '
+                f'files="{html.escape(json.dumps(files)) if files else ""}" '
+                f'embeds="{html.escape(json.dumps(embeds)) if embeds else ""}"{error_attr}>\n'
                 f"<summary>{summary}</summary>\n"
                 f"</details>\n"
             )
         else:
             # In-progress tool call - no result yet
             return (
-                f'\n<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
+                f'<details type="tool_calls" done="{done_str}" id="{html.escape(tool_call_id)}" name="{html.escape(tool_name)}" '
                 f'arguments="{escaped_args}">\n'
                 f"<summary>{summary}</summary>\n"
                 f"</details>\n"
@@ -5817,7 +5953,7 @@ class Pipe:
             output_json = json.dumps(output_data, ensure_ascii=False)
             attrs += f' output="{html.escape(output_json)}"'
 
-        return f"\n<details {attrs}>\n<summary>{summary}</summary>\n{display}\n</details>\n"
+        return f"<details {attrs}>\n<summary>{summary}</summary>\n{display}\n</details>\n"
 
     async def _emit_code_execution_source(
         self,
